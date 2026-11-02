@@ -325,6 +325,9 @@ alter table amine.profiles add column if not exists business_type text
   check (business_type is null or business_type in ('restaurant', 'cafe', 'hotel', 'snack', 'caterer', 'bakery', 'other'));
 alter table amine.profiles add column if not exists tax_id text
   check (tax_id is null or tax_id ~ '^[0-9A-Za-z/ .-]{4,30}$');
+-- Dernière présence dans l'application ouverte (touch_presence, 18_admin_home.sql) : une seule heure par
+-- compte, remplacée à chaque signal, jamais d'historique. Sert à compter les restaurants en ligne.
+alter table amine.profiles add column if not exists last_seen_at timestamptz;
 
 -- Référence du catalogue AMINE (illustration, synonymes de l'assistant).
 alter table amine.products add column if not exists ref text check (ref is null or ref ~ '^[a-z0-9-]{2,60}$');
@@ -4536,7 +4539,7 @@ language sql stable set search_path = '' as $$
   select jsonb_build_object('id', p.id, 'full_name', p.full_name, 'email', p.email, 'phone', p.phone,
     'phone_verified', p.phone_verified, 'business_name', p.business_name, 'business_type', p.business_type,
     'tax_id', p.tax_id, 'admin_note', p.admin_note, 'is_admin', p.is_admin, 'status', p.status, 'locale', p.locale,
-    'created_at', p.created_at,
+    'created_at', p.created_at, 'last_seen_at', p.last_seen_at,
     'payment_terms', p.payment_terms, 'payment_days', p.payment_days, 'credit_limit', p.credit_limit,
     'discount_bps', p.discount_bps, 'balance', amine.account_balance(p.id),
     'points', amine.loyalty_balance(p.id), 'marketing_opt_in', p.marketing_opt_in,
@@ -11080,3 +11083,91 @@ revoke all on function public.merchant_dashboard(uuid) from public, anon, authen
 grant execute on function public.merchant_dashboard(uuid) to authenticated;
 
 notify pgrst, 'reload schema';
+
+-- =============================================================================================
+--  Accueil de l'administrateur (version 11) : dossiers Commandes, Stockage, Livraisons et Restaurants
+--
+--  • touch_presence : l'application ouverte (onglet visible) signale la personne connectée, une fois par
+--    minute ; la base n'écrit qu'une fois toutes les 45 secondes au plus. Seule l'heure de la dernière
+--    présence est gardée (amine.profiles.last_seen_at, 01_schema.sql), jamais d'historique.
+--  • admin_home_folders : les chiffres des dossiers de l'accueil en un seul appel (achats, commandes, stockage,
+--    livraisons, restaurants), dont le nombre de restaurants en ligne (application ouverte dans les 3 dernières minutes).
+--
+--  Ce script complète les précédents ; il peut être rejoué sans risque. Une base qui ne l'a pas reçu
+--  garde une application qui marche : les dossiers prennent alors leurs chiffres dans admin_dashboard
+--  et le nombre de restaurants en ligne n'est pas affiché.
+-- =============================================================================================
+
+create index if not exists profiles_last_seen_idx on amine.profiles (last_seen_at) where last_seen_at is not null;
+
+-- Restaurants : comptes clients, c'est-à-dire ni administrateur, ni livreur, ni équipe d'un dépôt (comme admin_clients).
+create or replace function amine.is_restaurant(p amine.profiles) returns boolean
+language sql stable set search_path = '' as $$
+  select (p.email is not null or p.full_name <> '') and not p.is_admin
+    and not exists (select 1 from amine.couriers c where c.user_id = p.id and c.status <> 'archived')
+    and not exists (select 1 from amine.store_staff st where st.user_id = p.id)
+$$;
+
+-- Présence : la personne connectée a l'application ouverte.
+create or replace function public.touch_presence() returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  v_uid uuid := amine.uid();
+begin
+  update amine.profiles set last_seen_at = now()
+  where id = v_uid and (last_seen_at is null or last_seen_at < now() - interval '45 seconds');
+  return jsonb_build_object('ok', true);
+end $$;
+
+-- Chiffres des dossiers de l'accueil de l'administrateur.
+create or replace function public.admin_home_folders() returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  a amine.profiles := amine.require_admin();
+  v_today date := (now() at time zone 'Africa/Tunis')::date;
+begin
+  return jsonb_build_object(
+    'updated_at', now(),
+    'online_minutes', 3,
+    'orders', (select jsonb_build_object(
+        'active', count(*),
+        'to_accept', count(*) filter (where o.status = 'placed'),
+        'late', count(*) filter (where (coalesce(o.delivery_slot, 'asap') = 'asap' and o.placed_at < now() - interval '90 minutes')
+          or (coalesce(o.delivery_slot, 'asap') <> 'asap' and now() > amine.slot_end(o.deliver_on, o.delivery_slot))))
+      from amine.orders o where o.status in ('placed', 'accepted', 'preparing', 'ready', 'picked_up')),
+    'stock', (select jsonb_build_object(
+        'out', count(*) filter (where pr.stock = 0),
+        'low', count(*) filter (where pr.stock > 0 and pr.stock < amine.stock_floor(pr)),
+        'expiring', (select count(*) from amine.purchase_lines l join amine.purchases pu on pu.id = l.purchase_id
+          join amine.products p2 on p2.id = l.product_id
+          where pu.status = 'received' and l.expiry_on between v_today and v_today + 3 and l.remaining > 0 and p2.deleted_at is null))
+      from amine.products pr join amine.stores s on s.id = pr.store_id
+      where pr.deleted_at is null and pr.stock is not null and s.status = 'active'),
+    'purchases', (select jsonb_build_object(
+        'draft', count(*) filter (where po.status = 'draft'),
+        'sent', count(*) filter (where po.status = 'sent'))
+      from amine.purchase_orders po join amine.stores s3 on s3.id = po.store_id
+      where po.status in ('draft', 'sent') and s3.status = 'active'),
+    'deliveries', (select jsonb_build_object(
+        'on_the_way', count(*) filter (where o.status = 'picked_up'),
+        'waiting_courier', count(*) filter (where o.courier_id is null and o.status in ('accepted', 'preparing', 'ready') and amine.job_open(o)),
+        'today', count(*) filter (where o.kind = 'store' and o.deliver_on = v_today),
+        'unrouted', count(*) filter (where o.kind = 'store' and o.route_id is null and o.deliver_on = v_today
+          and o.status in ('accepted', 'preparing', 'ready')),
+        'couriers_online', (select count(*) from amine.couriers c where c.status = 'approved' and c.is_online
+          and c.last_seen_at > now() - interval '20 minutes'))
+      from amine.orders o where o.status in ('placed', 'accepted', 'preparing', 'ready', 'picked_up')
+        or (o.kind = 'store' and o.deliver_on = v_today and o.status = 'delivered')),
+    'restaurants', (select jsonb_build_object(
+        'total', count(*),
+        'online', count(*) filter (where p.status = 'active' and p.last_seen_at > now() - interval '3 minutes'))
+      from amine.profiles p where amine.is_restaurant(p)),
+    'depots', coalesce((select jsonb_agg(jsonb_build_object('id', s.id, 'name', s.name) order by s.created_at)
+      from amine.stores s where s.status = 'active'), '[]'::jsonb));
+end $$;
+
+revoke all on all functions in schema amine from public, anon, authenticated;
+revoke all on function public.touch_presence() from public, anon, authenticated;
+revoke all on function public.admin_home_folders() from public, anon, authenticated;
+grant execute on function public.touch_presence() to authenticated;
+grant execute on function public.admin_home_folders() to authenticated;
