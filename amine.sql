@@ -11171,3 +11171,24 @@ revoke all on function public.touch_presence() from public, anon, authenticated;
 revoke all on function public.admin_home_folders() from public, anon, authenticated;
 grant execute on function public.touch_presence() to authenticated;
 grant execute on function public.admin_home_folders() to authenticated;
+
+-- Aucune marque n'est enregistrée : AMINE ne vend que des produits sans marque (09/11/2026).
+-- Un produit saisi, importé ou modifié avec une marque la perd aussitôt : la colonne reste vide.
+create or replace function amine.products_no_brand()
+returns trigger
+language plpgsql
+set search_path = amine, public
+as $$
+begin
+  new.brand := null;
+  return new;
+end;
+$$;
+
+drop trigger if exists amine_products_no_brand on amine.products;
+create trigger amine_products_no_brand
+  before insert or update on amine.products
+  for each row execute function amine.products_no_brand();
+
+-- Les marques déjà enregistrées (avant le 09/11/2026) sont effacées une fois pour toutes.
+update amine.products set brand = null where brand is not null;

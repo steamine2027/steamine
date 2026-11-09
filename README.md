@@ -17,10 +17,9 @@ sinon l'application affiche « mise à jour de la base nécessaire ».
 Le service worker affiche aussi les notifications push (application fermée) quand l'envoi est
 activé dans l'administration et la fonction Supabase « amine-push » déployée.
 
-Dossier `photos/` : images des articles du catalogue (JPEG 360 × 360 px), affichées à la place de
-l'illustration dessinée pour les références qui en ont une (environ 160 sur 751). Ce sont des
+Dossier `photos/` : images des articles du catalogue (JPEG 360 × 360 px). Ce sont des
 **images générées par IA** fournies par l'exploitant, pas des photographies d'articles réels, et
 elles ne portent ni licence ni crédit : les emballages de marque qu'elles montrent peuvent ne
 pas correspondre exactement aux produits vendus. Un dépôt peut les remplacer article par article (fiche produit) ou en
-masse avec « Photos réelles » (Wikimedia Commons, Open Food Facts, crédit enregistré). Si une
-image ne charge pas, l'illustration reprend sa place.
+masse avec « Photos réelles » (Wikimedia Commons, Open Food Facts, crédit enregistré). Les articles
+sans photo ne sont pas proposés aux restaurants.
