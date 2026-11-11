@@ -11332,3 +11332,43 @@ create trigger amine_products_no_brand
 
 -- Les marques déjà enregistrées (avant le 09/11/2026) sont effacées une fois pour toutes.
 update amine.products set brand = null where brand is not null;
+
+-- =============================================================================================
+--  Lecture des photos par l'IA (fonction « amine-read-photo ») : limite d'usage par personne et par jour
+--
+--  L'assistant lit d'abord la photo sur l'appareil. Quand il n'y arrive pas (photo d'un produit, écriture difficile),
+--  la fonction demande à l'IA ce que montre la photo. Chaque appel est compté ici : au-delà de la limite du jour,
+--  la fonction refuse, pour qu'un compte ne puisse pas faire payer des appels sans fin.
+--  Aucune photo n'est enregistrée : seulement un compteur par personne et par jour.
+--
+--  Ce script complète les précédents ; il peut être rejoué sans risque.
+-- =============================================================================================
+
+create table if not exists amine.photo_reads (
+  user_id uuid not null,
+  day     date not null default ((now() at time zone 'Africa/Tunis')::date),
+  count   int  not null default 0,
+  primary key (user_id, day)
+);
+alter table amine.photo_reads enable row level security;
+revoke all on amine.photo_reads from public, anon, authenticated;
+
+-- Compte une lecture pour la personne ; faux si la limite du jour est déjà atteinte (rien n'est alors compté).
+create or replace function amine.photo_read_take(p_user uuid, p_limit int default 30) returns boolean
+language plpgsql security definer set search_path = '' as $$
+declare
+  today date := (now() at time zone 'Africa/Tunis')::date;
+  n int;
+begin
+  if p_user is null or p_limit is null or p_limit < 1 then
+    return false;
+  end if;
+  insert into amine.photo_reads as r (user_id, day, count) values (p_user, today, 1)
+  on conflict (user_id, day) do update set count = r.count + 1 where r.count < p_limit
+  returning r.count into n;
+  -- Les compteurs de plus d'un mois ne servent plus.
+  delete from amine.photo_reads where day < today - 31;
+  return n is not null;
+end $$;
+
+revoke all on function amine.photo_read_take(uuid, int) from public, anon, authenticated;
