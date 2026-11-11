@@ -11085,6 +11085,146 @@ grant execute on function public.merchant_dashboard(uuid) to authenticated;
 notify pgrst, 'reload schema';
 
 -- =============================================================================================
+--  Envoi automatique des notifications sur WhatsApp (API WhatsApp Cloud de Meta, version 11)
+--
+--  • La file amine.whatsapp_outbox (sql/16) reçoit chaque notification concernée des personnes qui ont activé
+--    WhatsApp. À chaque nouvelle ligne, la base réveille la fonction « amine-whatsapp » (extension pg_net, même
+--    schéma que les notifications push). La fonction envoie chaque message avec un modèle approuvé par Meta, puis
+--    le marque « sent ». Un échec passager reste en file (5 essais au plus) ; un échec définitif passe en « failed ».
+--  • Désactivé par défaut : rien ne part tant que amine.whatsapp_gateway.enabled n'est pas vrai (voir la fin du
+--    fichier). Les jetons Meta ne sont jamais dans la base : ils sont dans les secrets de la fonction.
+--
+--  Ce script complète les précédents ; il peut être rejoué sans risque.
+-- =============================================================================================
+
+alter table amine.whatsapp_outbox add column if not exists attempts int not null default 0;
+alter table amine.whatsapp_outbox add column if not exists taken_at timestamptz;
+alter table amine.whatsapp_outbox add column if not exists sent_at timestamptz;
+alter table amine.whatsapp_outbox add column if not exists provider_id text;
+alter table amine.whatsapp_outbox add column if not exists last_error text;
+alter table amine.whatsapp_outbox drop constraint if exists whatsapp_outbox_status_check;
+alter table amine.whatsapp_outbox add constraint whatsapp_outbox_status_check check (status in ('pending', 'sent', 'skipped', 'failed'));
+
+-- ── Passerelle : interrupteur, adresse de la fonction, jeton de réveil (connu de la base et de la fonction seulement) ──
+create table if not exists amine.whatsapp_gateway (
+  id           int primary key default 1 check (id = 1),
+  enabled      boolean not null default false,
+  function_url text not null default '',
+  wake_token   text not null
+);
+insert into amine.whatsapp_gateway (id, wake_token)
+values (1, replace(gen_random_uuid()::text || gen_random_uuid()::text, '-', ''))
+on conflict (id) do nothing;
+alter table amine.whatsapp_gateway enable row level security;
+revoke all on amine.whatsapp_gateway from public, anon, authenticated;
+
+-- Réveille la fonction (une fois par transaction, s'il reste des messages à envoyer). Sans pg_net : rien.
+create or replace function amine.whatsapp_wake() returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  g amine.whatsapp_gateway;
+begin
+  select * into g from amine.whatsapp_gateway where id = 1;
+  if not found or not g.enabled or g.function_url = ''
+     or coalesce(current_setting('amine.whatsapp_woken', true), '') = '1'
+     or not exists (select 1 from pg_extension where extname = 'pg_net')
+     or not exists (select 1 from amine.whatsapp_outbox o where o.status = 'pending' and o.attempts < 5
+                    and (o.taken_at is null or o.taken_at < now() - interval '2 minutes')) then
+    return;
+  end if;
+  perform set_config('amine.whatsapp_woken', '1', true);
+  execute 'select net.http_post(url := $1, body := $2, headers := $3, timeout_milliseconds := 5000)'
+    using g.function_url, '{}'::jsonb,
+      jsonb_build_object('Content-Type', 'application/json', 'x-amine-wake', g.wake_token);
+exception when others then
+  raise warning 'amine whatsapp_wake: %', sqlerrm;
+end $$;
+
+create or replace function amine.on_whatsapp_outbox() returns trigger
+language plpgsql set search_path = '' as $$
+begin
+  perform amine.whatsapp_wake();
+  return null;
+end $$;
+
+drop trigger if exists amine_whatsapp_outbox_wake on amine.whatsapp_outbox;
+create trigger amine_whatsapp_outbox_wake
+  after insert on amine.whatsapp_outbox
+  for each row execute function amine.on_whatsapp_outbox();
+
+-- Prend jusqu'à p_limit messages à envoyer. Ils sont réservés deux minutes, pour qu'un autre appel ne les envoie pas
+-- deux fois. Passerelle désactivée : rien n'est pris.
+create or replace function amine.whatsapp_take(p_limit int default 50) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  g amine.whatsapp_gateway;
+  v jsonb;
+begin
+  select * into g from amine.whatsapp_gateway where id = 1;
+  if not found or not g.enabled then
+    return '[]'::jsonb;
+  end if;
+  with picked as (
+    select o.id from amine.whatsapp_outbox o
+    where o.status = 'pending' and o.attempts < 5 and (o.taken_at is null or o.taken_at < now() - interval '2 minutes')
+    order by o.created_at
+    limit greatest(1, least(coalesce(p_limit, 50), 200))
+    for update skip locked
+  ), taken as (
+    update amine.whatsapp_outbox o
+      set taken_at = now(), attempts = o.attempts + 1
+      from picked
+      where o.id = picked.id
+      returning o.id, o.phone, o.locale, o.kind, o.params, o.link
+  )
+  select coalesce(jsonb_agg(jsonb_build_object(
+      'id', id, 'phone', phone, 'locale', locale, 'kind', kind, 'params', params, 'link', link)), '[]'::jsonb)
+    into v from taken;
+  return v;
+end $$;
+
+-- Résultats d'un envoi : [{"id", "ok": true, "provider_id"}] ou [{"id", "ok": false, "error", "permanent"}].
+-- Un échec définitif, ou le cinquième essai raté, passe en « failed » ; sinon le message reste en file.
+create or replace function amine.whatsapp_done(p_results jsonb) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  r jsonb;
+  n int := 0;
+begin
+  if jsonb_typeof(coalesce(p_results, 'null'::jsonb)) <> 'array' then
+    perform amine.err('INVALID_INPUT', 'results');
+  end if;
+  for r in select value from jsonb_array_elements(p_results) loop
+    if coalesce((r ->> 'ok')::boolean, false) then
+      update amine.whatsapp_outbox
+        set status = 'sent', sent_at = now(), provider_id = r ->> 'provider_id', taken_at = null, last_error = null
+        where id = (r ->> 'id')::uuid and status = 'pending';
+    else
+      update amine.whatsapp_outbox
+        set status = case when coalesce((r ->> 'permanent')::boolean, false) or attempts >= 5 then 'failed' else 'pending' end,
+            taken_at = null,
+            last_error = left(coalesce(r ->> 'error', ''), 300)
+        where id = (r ->> 'id')::uuid and status = 'pending';
+    end if;
+    if found then
+      n := n + 1;
+    end if;
+  end loop;
+  return jsonb_build_object('updated', n);
+end $$;
+
+revoke all on function amine.whatsapp_wake() from public, anon, authenticated;
+revoke all on function amine.on_whatsapp_outbox() from public, anon, authenticated;
+revoke all on function amine.whatsapp_take(int) from public, anon, authenticated;
+revoke all on function amine.whatsapp_done(jsonb) from public, anon, authenticated;
+
+-- ── Activation (à faire une fois la fonction déployée, voir supabase/functions/amine-whatsapp/index.ts) ──
+--   update amine.whatsapp_gateway
+--     set enabled = true, function_url = 'https://<projet>.supabase.co/functions/v1/amine-whatsapp'
+--     where id = 1;
+-- Pour arrêter : enabled = false. Les messages restent en file.
+
+-- =============================================================================================
 --  Accueil de l'administrateur (version 11) : dossiers Commandes, Stockage, Livraisons et Restaurants
 --
 --  • touch_presence : l'application ouverte (onglet visible) signale la personne connectée, une fois par
