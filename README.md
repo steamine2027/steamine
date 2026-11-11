@@ -23,7 +23,10 @@ catalogues et planches produits envoyés par le dépôt**, et les fichiers `plan
 les six planches sans marque fournies par l'exploitant le 10/11/2026** (fromages, volailles et œufs, pâtes,
 boissons, emballages, entretien). Ces dernières sont des illustrations génériques : elles montrent le type de
 produit, pas l'emballage exact. **Depuis le 11/11/2026, les produits en vente ne sont illustrés que par ces
-planches** ; les autres fichiers ne servent plus qu'au catalogue de référence qu'un dépôt peut importer. Aucune
+planches** ; les autres fichiers ne servent plus qu'au catalogue de référence qu'un dépôt peut importer. Les 30
+produits que ces planches ne montrent pas (huiles, thons, tomates en conserve, concentré, sauce pizza, farines, sel,
+couscous, chorba frik, lasagnes, fromages fondus, bloc WC, lessive) reçoivent une image générique fournie par
+l'exploitant le 11/11/2026 (`generique-*.jpg`) : correspondance approximative, le type de produit seulement. Aucune
 photo ne porte de licence ni de crédit, et les emballages de marque que montrent les plus anciennes peuvent ne
 pas correspondre exactement aux produits vendus. Un dépôt
 peut les remplacer article par article (fiche produit) ou en masse avec « Photos réelles » (Wikimedia Commons,
