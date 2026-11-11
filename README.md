@@ -17,10 +17,15 @@ sinon l'application affiche « mise à jour de la base nécessaire ».
 Le service worker affiche aussi les notifications push (application fermée) quand l'envoi est
 activé dans l'administration et la fonction Supabase « amine-push » déployée.
 
-Dossier `photos/` : images des articles du catalogue (JPEG 360 × 360 px). Elles viennent de deux sources :
+Dossier `photos/` : images des articles du catalogue (JPEG, 360 à 480 px de côté). Elles viennent de trois sources :
 la plupart sont **générées par IA** et fournies par l'exploitant, d'autres sont **découpées dans les
-catalogues et planches produits envoyés par le dépôt**. Aucune ne porte de licence ni de crédit, et les
-emballages de marque qu'elles montrent peuvent ne pas correspondre exactement aux produits vendus. Un dépôt
+catalogues et planches produits envoyés par le dépôt**, et les fichiers `planche-*.jpg` sont **découpés dans
+les six planches sans marque fournies par l'exploitant le 10/11/2026** (fromages, volailles et œufs, pâtes,
+boissons, emballages, entretien). Ces dernières sont des illustrations génériques : elles montrent le type de
+produit, pas l'emballage exact. **Depuis le 11/11/2026, les produits en vente ne sont illustrés que par ces
+planches** ; les autres fichiers ne servent plus qu'au catalogue de référence qu'un dépôt peut importer. Aucune
+photo ne porte de licence ni de crédit, et les emballages de marque que montrent les plus anciennes peuvent ne
+pas correspondre exactement aux produits vendus. Un dépôt
 peut les remplacer article par article (fiche produit) ou en masse avec « Photos réelles » (Wikimedia Commons,
 Open Food Facts, crédit enregistré). Les articles sans photo ne sont pas proposés aux restaurants.
 
