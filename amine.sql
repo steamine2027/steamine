@@ -1135,6 +1135,19 @@ language sql immutable set search_path = '' as $$
   select least(z.max_fee, z.base_fee + z.per_km_fee * greatest(0, ceil(p_km - z.included_km))::int)
 $$;
 
+-- Livraison des commandes de dépôt : gratuite dès 150 DT de commande, 5 DT fixe en dessous (montants en millimes).
+-- Remplace le tarif par zone et par km. Les colis (fee_for) gardent leur tarif.
+create or replace function amine.store_delivery_fee(p_subtotal bigint) returns int
+language sql immutable set search_path = '' as $$
+  select case when p_subtotal >= 150000 then 0 else 5000 end
+$$;
+
+-- Seuil de livraison gratuite et frais fixe, publiés à l'application.
+create or replace function amine.store_delivery_threshold() returns jsonb
+language sql immutable set search_path = '' as $$
+  select jsonb_build_object('free_from', 150000, 'fee', 5000)
+$$;
+
 -- Horaires ------------------------------------------------------------------------------------
 create or replace function amine.default_hours() returns jsonb
 language sql immutable set search_path = '' as $$
@@ -1861,7 +1874,7 @@ begin
   return jsonb_build_object(
     'zone', v_zone,
     'depot', amine.store_card(s) || jsonb_build_object('phone', s.phone, 'hours', s.hours, 'distance_km', v_km,
-      'delivery_fee', case when v_delivers then amine.fee_for(sz, v_km) end, 'delivers', v_delivers),
+      'delivery_fee', case when v_delivers then amine.store_delivery_fee(0) end, 'delivery_free_from', 150000, 'delivers', v_delivers),
     'sections', coalesce((
       select jsonb_agg(jsonb_build_object('id', sc.id, 'name', sc.name, 'name_ar', sc.name_ar, 'name_en', sc.name_en)
         order by sc.sort, sc.name)
@@ -1871,7 +1884,22 @@ begin
           else jsonb_build_object('client_price', nullif(amine.unit_price(p, v_uid, 1), p.price)) end
           || amine.flash_card(p, v_uid)
         order by p.sort, p.name)
-      from amine.products p where p.store_id = s.id and p.deleted_at is null and p.is_available), '[]'::jsonb));
+      from amine.products p where p.store_id = s.id and p.deleted_at is null and p.is_available), '[]'::jsonb),
+    -- « Prix du jour » de l'accueil : les 4 produits disponibles les plus commandés au dépôt sur 30 jours
+    -- (puis l'ordre du catalogue quand il y a peu de commandes). Le prix affiché est celui du produit, modifié par l'administration.
+    'daily_ids', coalesce((
+      select jsonb_agg(x.id order by x.rank)
+      from (
+        select p.id, row_number() over (order by coalesce(t.sold, 0) desc, p.sort, p.name) as rank
+        from amine.products p
+        left join (
+          select it.product_id, sum(it.quantity) as sold
+          from amine.order_items it join amine.orders o on o.id = it.order_id
+          where o.store_id = s.id and o.status not in ('cancelled', 'rejected') and o.placed_at > now() - interval '30 days'
+          group by it.product_id) t on t.product_id = p.id
+        where p.store_id = s.id and p.deleted_at is null and p.is_available and (p.stock is null or p.stock > 0)
+        order by coalesce(t.sold, 0) desc, p.sort, p.name
+        limit 4) x), '[]'::jsonb));
 end $$;
 
 -- Prix d'un panier, recalculés à partir de la base (jamais à partir du navigateur).
@@ -2092,9 +2120,9 @@ begin
     elsif v_km > v_max_km then
       v_reason := 'TOO_FAR';
     end if;
-    v_fee := amine.fee_for(sz, v_km);
+    v_fee := amine.store_delivery_fee(v_sub);
   else
-    v_fee := sz.base_fee;
+    v_fee := amine.store_delivery_fee(v_sub);
   end if;
   if not sz.is_active or not (s.kind = any (sz.services)) then
     v_reason := 'SERVICE_UNAVAILABLE';
@@ -2470,7 +2498,7 @@ begin
   if v_sub < s.min_order then
     perform amine.err('MIN_ORDER_NOT_REACHED', s.min_order::text);
   end if;
-  v_fee := amine.fee_for(sz, v_km);
+  v_fee := amine.store_delivery_fee(v_sub);
   -- Code promo (la ligne est verrouillée : deux commandes simultanées ne dépassent pas les limites).
   v_promo := amine.promo_eval(p_promo_code, p.id, s, v_sub, v_fee, v_service, true);
   if v_promo is not null then
